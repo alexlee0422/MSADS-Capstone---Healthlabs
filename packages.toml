@@ -2,4 +2,4 @@
 
 # Set the Python version to a stable release that is well-supported by all Python packages
 [tool.streamlit]
-python_version = "3.11"
+python_version = "3.12.7"
