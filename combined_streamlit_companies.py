@@ -18,7 +18,7 @@ from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain_core.runnables import RunnableLambda
 from langchain_core.prompts import ChatPromptTemplate
 from streamlit_gsheets import GSheetsConnection
-
+import gspread
 
 # --- CONFIGURATION ---
 LOCAL_DATA_FILE = "data/merged_data.csv"
