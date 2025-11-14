@@ -1,9 +1,4 @@
 import streamlit as st
-
-st.write("🔍 Debugging private key:")
-st.code(st.secrets["gspread_auth"]["private_key"][:200])
-
-import streamlit as st
 import pandas as pd
 import json
 import os
@@ -24,6 +19,10 @@ from langchain_core.runnables import RunnableLambda
 from langchain_core.prompts import ChatPromptTemplate
 from streamlit_gsheets import GSheetsConnection
 import gspread
+
+from google.oauth2.service_account import Credentials
+st.write("🔍 Debugging private key:")
+st.code(st.secrets["gspread_auth"]["private_key"][:200])
 
 # --- CONFIGURATION ---
 LOCAL_DATA_FILE = "data/merged_data.csv"
