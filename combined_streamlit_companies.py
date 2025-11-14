@@ -384,21 +384,37 @@ def get_external_data_snippets(website_url: str) -> str:
 def save_feedback(feedback_data: dict):
     """Appends a dictionary of feedback to the Google Sheet."""
     try:
-        # Convert the dict to a DataFrame.
+        # 1. Convert the dictionary to a DataFrame
         df = pd.DataFrame([feedback_data]) 
-
-        # Establish the connection
+        
+        # 2. Establish the connection
         conn = st.connection("gsheets", type=GSheetsConnection)
+        
+        # --- THIS IS THE CORRECT LOGIC ---
+        
+        # 3. Get the Spreadsheet URL and Worksheet name from your secrets
+        ss_url = conn._secrets.get("spreadsheet")
+        worksheet_name = conn._secrets.get("worksheet")
+        
+        if not ss_url:
+            st.error("GSheets Error: 'spreadsheet' URL is not set in secrets!")
+            return False
+        if not worksheet_name:
+            st.error("GSheets Error: 'worksheet' name is not set in secrets!")
+            return False
 
-        # Use the built-in append method.
-        # It will automatically find the "spreadsheet" URL and
-        # "worksheet" name from your secrets.
-        conn.append(
-            worksheet="Sheet1", # Make sure this matches your tab name!
-            data=df,
-            header=False # Don't add headers every time
-        )
+        # 4. Use the underlying gspread client (conn.client) to open the sheet
+        #    This client was authenticated by your secrets.
+        worksheet = conn.client.open_by_url(ss_url).worksheet(worksheet_name)
+        
+        # 5. Convert the DataFrame row to a simple list for appending
+        row_to_append = df.values.tolist()[0]
+        
+        # 6. Use the gspread .append_row() method to add the data
+        worksheet.append_row(row_to_append)
+        
         return True
+    
     except Exception as e:
         # Log the error to the Streamlit console for debugging
         st.error(f"Error saving feedback to Google Sheets: {e}")
