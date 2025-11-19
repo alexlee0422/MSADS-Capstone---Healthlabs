@@ -25,9 +25,6 @@ LOCAL_DATA_FILE = "data/merged_data.csv"
 CHROMA_DB_PATH = "chroma_db"
 # --- NEW: Separate path for the PRODUCT-level vector store ---
 CHROMA_COMPANY_DB_PATH = "chroma_company_db"
-# --- NEW: Feedback file path ---
-# <-- MODIFIED: Removed the FEEDBACK_FILE line. We don't need it.
-# -------------------------------
 
 # --- NEW: MODEL CONFIGURATION ---
 MODEL_CONFIG = {
@@ -154,10 +151,10 @@ def load_product_vectorstore(api_key):
         st.error(f"Error loading product vector store: {e}")
         return None
 
-# --- NEW: Execute Full-Text Ranking ---
+# --- NEW: Execute Full-Text Ranking (Step 3 - Re-ranking specific candidates) ---
 def execute_full_text_ranking(product_vectorstore, synergy_strategies, final_product_list):
     """
-    MODIFIED: Manually calculates the vector distance between each pillar
+    Manually calculates the vector distance between each pillar
     and the full-text embeddings of ALL products in the final shortlist.
     This does NOT filter, only re-ranks.
     """
@@ -166,11 +163,6 @@ def execute_full_text_ranking(product_vectorstore, synergy_strategies, final_pro
     if not final_product_list:
         st.warning("No products in the final shortlist to re-rank.")
         return {}
-
-    # --- DEBUGGING LINE ---
-    st.info(f"Debugging: {len(final_product_list)} products from RAG being used for distance filter:")
-    st.json(final_product_list)
-    # --- END DEBUGGING ---
 
     try:
         # --- This part can be done ONCE, outside the loop ---
@@ -197,7 +189,6 @@ def execute_full_text_ranking(product_vectorstore, synergy_strategies, final_pro
 
         # 4. Iterate through each pillar, get its embedding, and score
         for pillar_name, pillar_description in synergy_strategies.items():
-            # --- This try/except is for each pillar, which is safer ---
             try:
                 # 4a. Get the embedding for the pillar text
                 pillar_embedding = np.array(embedding_function.embed_query(pillar_description))
@@ -208,9 +199,8 @@ def execute_full_text_ranking(product_vectorstore, synergy_strategies, final_pro
                 for product_name, (company_name, product_vector) in product_embedding_map.items():
 
                     # Calculate Cosine Distance
-                    # Cosine Similarity = (A . B) / (||A|| * ||B||)
-                    # Cosine Distance = 1 - Cosine Similarity (lower is better)
-
+                    # Cosine Sim = (A . B) / (||A|| * ||B||)
+                    # Distance = 1 - Similarity
                     cosine_sim = np.dot(pillar_embedding, product_vector) / (norm(pillar_embedding) * norm(product_vector))
                     distance = 1 - cosine_sim
 
@@ -238,17 +228,104 @@ def execute_full_text_ranking(product_vectorstore, synergy_strategies, final_pro
                 distance_ranking_results[pillar_name] = [] # Set empty list for this pillar
 
     except Exception as e:
-        # This catches errors in the pre-loop (e.g., .get() failing)
         st.error(f"Error during manual distance calculation setup: {e}")
-        st.exception(e)
-        return {} # Return empty dict if setup fails
+        return {}
 
     return distance_ranking_results
+
+# --- NEW STEP 5 (now 4): Global Product Retrieval by Distance ---
+def execute_product_level_retrieval_step5(product_vectorstore, synergy_strategies, target_product_name, top_k=8):
+    """
+    Step 4: Performs a FRESH retrieval from the full Product Vector Store, returning top_k=8 unique matches.
+    """
+    retrieval_results = {}
+
+    if product_vectorstore is None:
+        st.error("Product vector store is not loaded.")
+        return {}
+
+    embedding_function = product_vectorstore._embedding_function
+
+    try:
+        for pillar_name, pillar_desc in synergy_strategies.items():
+            # 1. Embed the query string manually
+            pillar_embedding = np.array(embedding_function.embed_query(pillar_desc))
+
+            # 2. Use Chroma to find closest vectors (Index Search)
+            # Buffer size is top_k * 5 (8 * 5 = 40)
+            docs = product_vectorstore.similarity_search(pillar_desc, k=top_k * 5)
+
+            # 3. Retrieve the actual embeddings for these candidates to recalculate score accurately
+            # Collect unique product names from the initial search results, excluding the target
+            candidate_products = list(set(
+                d.metadata.get('Product') for d in docs
+                if d.metadata.get('Product') != target_product_name and d.metadata.get('Product') is not None
+            ))
+
+            # Bulk fetch embeddings for candidates
+            if not candidate_products:
+                continue
+
+            # Need to filter the product data that comes back from Chroma
+            product_data = product_vectorstore.get(
+                where={"Product": {"$in": candidate_products}},
+                include=["metadatas", "embeddings"]
+            )
+
+            # Map: Product -> Embedding & Company
+            emb_map = {}
+            company_map = {}
+            if product_data and product_data.get('ids'):
+                for i in range(len(product_data['ids'])):
+                    p_name = product_data['metadatas'][i]['Product']
+                    comp_name = product_data['metadatas'][i]['Company']
+                    emb = product_data['embeddings'][i]
+                    emb_map[p_name] = np.array(emb)
+                    company_map[p_name] = comp_name # Store company name
+
+            # 4. Calculate precise Cosine Distance for ALL unique candidates
+            all_scored_candidates = []
+
+            for prod_name in candidate_products:
+                if prod_name not in emb_map:
+                    continue
+
+                product_vector = emb_map[prod_name]
+                comp_name = company_map.get(prod_name, 'Unknown')
+
+                # CALCULATION: 1 - Cosine Similarity
+                cosine_sim = np.dot(pillar_embedding, product_vector) / (norm(pillar_embedding) * norm(product_vector))
+                distance = 1 - cosine_sim
+
+                all_scored_candidates.append({
+                    "Product": prod_name,
+                    "Company": comp_name,
+                    "Distance": f"{distance:.4f}",
+                    "raw_score": distance
+                })
+
+            # 5. SORT by distance (Best/Lowest first)
+            all_scored_candidates.sort(key=lambda x: x['raw_score'])
+
+            # 6. Slice the top K unique results
+            final_unique_results = all_scored_candidates[:top_k]
+
+            # Add rank and clean keys
+            for i, res in enumerate(final_unique_results):
+                res['Rank'] = i + 1
+                final_unique_results[i] = {k: res[k] for k in ['Rank', 'Product', 'Company', 'Distance']}
+
+            retrieval_results[pillar_name] = final_unique_results
+
+    except Exception as e:
+        st.error(f"Error during Step 4 Global Retrieval: {e}")
+        return {}
+
+    return retrieval_results
 
 
 def calculate_llm_cost_p1(input_tokens_per_call, output_tokens_per_call, num_calls, model_name):
     """Estimates the max token usage and cost for API calls in Pipeline 1."""
-    # MODIFIED: Use dynamic costs from MODEL_CONFIG
     model_pricing = MODEL_CONFIG.get(model_name)
     if not model_pricing:
         st.error(f"Pricing for model '{model_name}' not found. Defaulting to gpt-4o pricing.")
@@ -269,12 +346,11 @@ def calculate_llm_cost_p1(input_tokens_per_call, output_tokens_per_call, num_cal
 def estimate_pipeline_cost_p1(api_key, merged_data, target_product_input, num_angles, model_name):
     """
     Calculates the estimated cost for the entire Pipeline 1 run.
-    (This is the ORIGINAL product-to-product logic)
+    NOTE: LLM 3 (Scorer) cost is removed.
     """
-    # This correctly uses the new 'merged_data' dataframe
     target_product_row = merged_data.loc[merged_data['Product'] == target_product_input].iloc[0]
     target_doc_length = len(target_product_row['doc_text'].split())
-    target_doc_tokens = int(target_doc_length * 1.33) # Convert word count to estimated tokens
+    target_doc_tokens = int(target_doc_length * 1.33)
 
     # 1. Estimate Stage 1 (LLM 1 - Strategist)
     llm1_input_tokens = 500 + target_doc_tokens
@@ -284,23 +360,21 @@ def estimate_pipeline_cost_p1(api_key, merged_data, target_product_input, num_an
     llm2_input_tokens = 800 + target_doc_tokens
     llm2_input, llm2_output, llm2_cost = calculate_llm_cost_p1(llm2_input_tokens, 300, num_angles, model_name)
 
-    # 3. Estimate Stage 4 (LLM 3 - Scorer)
-    N_c_estimate = max(5, int(num_angles * 2.5)) # Conservative estimate for number of candidates
-    llm3_input_tokens = 3500 + target_doc_tokens # (Base estimate for prompt + chunks) + target doc
-    llm3_input, llm3_output, llm3_cost = calculate_llm_cost_p1(llm3_input_tokens, 200, N_c_estimate, model_name)
+    # 3. LLM 3 (Scorer) cost removed.
+    N_c_estimate = 0
+    llm3_input = 0
+    llm3_output = 0
+    llm3_cost = 0
 
     # Total Estimate
     total_tokens = llm1_input + llm1_output + llm2_input + llm2_output + llm3_input + llm3_output
     total_cost = llm1_cost + llm2_cost + llm3_cost
-
-    # NOTE: No cost is added for the NEW company-level embedding/comparison step as it uses cached embeddings.
 
     return total_tokens, total_cost, N_c_estimate
 
 
 def calculate_llm_cost_p2(prompt_template_string, product_doc_1, product_doc_2, model_name):
     """Estimates the max token usage and cost for the API call in Pipeline 2."""
-    # MODIFIED: Use dynamic costs from MODEL_CONFIG
     model_pricing = MODEL_CONFIG.get(model_name)
     if not model_pricing:
         st.error(f"Pricing for model '{model_name}' not found. Defaulting to gpt-4o pricing.")
@@ -380,52 +454,26 @@ def get_external_data_snippets(website_url: str) -> str:
     except Exception as e:
         return f"*** EXTERNAL WEB DATA (FAILURE) ***\nAn unexpected error occurred during parsing: {e}"
 
-# --- NEW: Feedback Saving Function (using gspread directly) ---
+# --- Feedback Saving Function ---
 def save_feedback(feedback_data: dict):
     """Appends a dictionary of feedback to the Google Sheet."""
     try:
-        # 1. Convert the dictionary to a DataFrame
-        df = pd.DataFrame([feedback_data]) 
-        
-        # 2. Get all credentials from the [gspread_auth] section of secrets
+        df = pd.DataFrame([feedback_data])
         creds = st.secrets["gspread_auth"]
-        
-        # 3. Authenticate with gspread
         gc = gspread.service_account_from_dict(creds)
-        
-        # 4. Get the Spreadsheet URL and Worksheet name
         ss_url = creds.get("spreadsheet")
-        
-        # --- THIS IS THE TYPO FIX ---
-        worksheet_name = creds.get("worksheet") # Was "workskey"
-        
-        if not ss_url:
-            st.error("GSheets Error: 'spreadsheet' URL is not set in secrets!")
-            return False
-        if not worksheet_name:
-            # --- THIS ERROR MESSAGE IS ALSO FIXED ---
-            st.error("GSheets Error: 'worksheet' name is not set in secrets!")
+        worksheet_name = creds.get("worksheet")
+
+        if not ss_url or not worksheet_name:
+            st.error("GSheets Error: 'spreadsheet' or 'worksheet' not set in secrets!")
             return False
 
-        # 5. Open the Google Sheet by URL and select the worksheet
         worksheet = gc.open_by_url(ss_url).worksheet(worksheet_name)
-        
-        # 6. Convert the DataFrame row to a simple list for appending
         row_to_append = df.values.tolist()[0]
-        
-        # 7. Use the gspread .append_row() method to add the data
         worksheet.append_row(row_to_append)
-        
         return True
-    
-    except gspread.exceptions.APIError as e:
-        if "PERMISSION_DENIED" in str(e):
-             st.error("GSheets Error: PERMISSION DENIED. Have you shared your Google Sheet with the client_email?")
-        else:
-             st.error(f"GSheets API Error: {e}")
-        return False
+
     except Exception as e:
-        # Log the error to the Streamlit console for debugging
         st.error(f"Error saving feedback to Google Sheets: {e}")
         return False
 
@@ -435,13 +483,13 @@ def save_feedback(feedback_data: dict):
 
 # --- Pipeline 1 LLM Chains ---
 def define_llm_chains_p1(api_key, num_angles, model_name):
-    """Defines all three LLM chains for Pipeline 1."""
-    # MODIFIED: Use dynamic model_name
+    """
+    Defines LLM chains for Pipeline 1.
+    NOTE: LLM 3 (scorer_chain) is removed.
+    """
     llm = ChatOpenAI(model_name=model_name, temperature=0, openai_api_key=api_key)
 
-    # --- LLM 1: The Dynamic Strategist (PROMPT UPDATED from pipeline1_streamlit.py) ---
-    # The prompt is now highly explicit about the desired FLAT JSON structure.
-    # The example JSON { and } are DOUBLED to escape them inside the f-string.
+    # --- LLM 1: The Dynamic Strategist ---
     strategist_prompt_template = f"""
     You are a top-tier product strategist. Your goal is to identify broad categories of highly synergistic **PRODUCT TYPES** (service, technology, or data products) for the 'Target Product' below.
     Analyze the 'Target Product' and its features, then devise **{num_angles}** most potent partnership pillars. Each pillar MUST describe a **PRODUCT TYPE**.
@@ -455,7 +503,7 @@ def define_llm_chains_p1(api_key, num_angles, model_name):
 
     --- OUTPUT FORMAT ---
     Provide your response as a single, valid JSON object.
-    -   The **keys** of the JSON must be the **pillar names** you created (e.g., "Pillar 1: AI-Powered Diagnostics Tool").
+    -   The **keys** of the JSON must be the **pillar names** you created (e.g., "Pillar 1: AI-Powered Clinical Trial Matching").
     -   The **values** of the JSON must be the **detailed descriptions** (as a single string).
     -   You MUST provide exactly **{num_angles}** key-value pairs.
 
@@ -467,11 +515,10 @@ def define_llm_chains_p1(api_key, num_angles, model_name):
     """
 
     strategist_prompt = ChatPromptTemplate.from_template(strategist_prompt_template)
-    # We still use JsonOutputParser() because the output IS JSON, just a specific structure.
     strategist_chain = strategist_prompt | llm | JsonOutputParser()
 
 
-    # --- LLM 2: The Profiler (PROMPT UPDATED from pipeline1_streamlit.py) ---
+    # --- LLM 2: The Profiler ---
     profiler_prompt_template = """
     You are a brilliant business strategist. Based on the following 'Partnership Strategy', generate a rich, abstract profile of an ideal partner product.
     Do not invent a name for a product. Describe its features, target users, and core value proposition in detail.
@@ -483,26 +530,14 @@ def define_llm_chains_p1(api_key, num_angles, model_name):
     profiler_prompt = ChatPromptTemplate.from_template(profiler_prompt_template)
     profiler_chain = profiler_prompt | llm | StrOutputParser()
 
-    # --- LLM 3: The Initial Scorer (PROMPT UPDATED from pipeline1_streamlit.py) ---
-    scorer_prompt_template = """
-    You are a rapid-assessment business analyst. Assess the synergy potential between the 'Target Product' and the 'Potential Partner' based ONLY on the provided texts.
-    Provide a single score from 1 (low synergy) to 10 (high synergy) and a one-sentence justification.
-    --- TARGET PRODUCT ---
-    {target_doc}
-    --- POTENTIAL PARTNER CHUNKS ---
-    {candidate_chunks_text}
-    --- OUTPUT FORMAT ---
-    Provide your response as a JSON object with two keys: "score" and "reasoning".
-    """
-    scorer_prompt = ChatPromptTemplate.from_template(scorer_prompt_template)
-    scorer_chain = scorer_prompt | llm | JsonOutputParser()
+    # LLM 3 (Scorer Chain) REMOVED.
 
-    return strategist_chain, profiler_chain, scorer_chain
+    # Return only the two chains needed
+    return strategist_chain, profiler_chain
 
 # --- Pipeline 2 LLM Chain ---
 def define_analyst_chain_p2(api_key, prompt_template, model_name):
     """Defines the heavy LLM chain for detailed synergy analysis (LLM 3)."""
-    # MODIFIED: Use dynamic model_name
     llm = ChatOpenAI(model_name=model_name, temperature=0, openai_api_key=api_key)
     analyst_prompt = ChatPromptTemplate.from_template(prompt_template)
     return analyst_prompt | llm | StrOutputParser()
@@ -514,8 +549,8 @@ def define_analyst_chain_p2(api_key, prompt_template, model_name):
 @st.cache_data(show_spinner=False)
 def run_pipeline_execution_p1(api_key, merged_data, company_to_products_map, target_product_input, num_angles, _vectorstore, model_name):
     """
-    Executes the core RAG pipeline (P1) and returns the final ranked shortlist dataframe
-    and the intermediate candidate data frame.
+    Executes the core RAG pipeline (P1).
+    NOTE: LLM 3 scoring stage is removed.
     """
     # 1. SETUP: Create the normalized target name for RAG self-filtering
     target_name_normalized = re.sub(r'[^a-zA-Z0-9]', '', target_product_input.lower())
@@ -524,29 +559,26 @@ def run_pipeline_execution_p1(api_key, merged_data, company_to_products_map, tar
     target_product_row = merged_data.loc[merged_data['Product'] == target_product_input].iloc[0]
     target_product_description = target_product_row['doc_text']
 
-    # MODIFIED: Pass model_name to chain definition
-    strategist_chain, profiler_chain, scorer_chain = define_llm_chains_p1(api_key, num_angles, model_name)
+    # MODIFIED: Pass model_name to chain definition (only returns 2 chains now)
+    strategist_chain, profiler_chain = define_llm_chains_p1(api_key, num_angles, model_name)
 
     # --- STAGE 1: Dynamic Strategy Generation (LLM 1) ---
     st.subheader(f"1️⃣ Dynamic Strategy Generation (LLM 1) - {num_angles} Pillars")
     with st.spinner("🧠 Analyzing product and defining strategic pillars..."):
         # Use the cleaned doc_text (ASCII only) for the LLM
         clean_target_doc = target_product_description.encode("ascii", "ignore").decode("ascii")
-
-        # This 'synergy_strategies' will now be a flat {key: value} dict
-        # thanks to the prompt fix.
         synergy_strategies = strategist_chain.invoke({"target_doc": clean_target_doc})
-
         st.success("Strategic Pillars Generated.")
-        st.json(synergy_strategies) # This st.json() call still works perfectly.
+        st.json(synergy_strategies)
 
     st.markdown("---")
 
     # -------------------------------------------------------------------
-    # --- RAG Retrieval and LLM Scoring (STAGES 2, 3, 4 - NO CHANGE) ---
+    # --- RAG Retrieval and Candidate Aggregation (STAGES 2) ---
     # -------------------------------------------------------------------
 
-    # --- STAGE 2 & 3: Profile, Retrieve, and Aggregate Candidates (LLM 2 + RAG) ---
+    # --- STAGE 2: Profile, Retrieve, and Aggregate Candidates (LLM 2 + RAG) ---
+    # Renumbered for display
     st.subheader("2️⃣ Candidate Profiling and RAG Retrieval (LLM 2 + Chroma)")
     all_retrieved_chunks = []
     # Key now uses (Company, Product) to match the NEW RAG metadata schema
@@ -571,21 +603,18 @@ def run_pipeline_execution_p1(api_key, merged_data, company_to_products_map, tar
         # RAG: Retriever
         retrieved_docs = custom_retriever(hypothetical_doc)
 
-        # --- FIX: Self-filtering now uses the NEW 'Product' metadata key ---
         filtered_docs = []
         for doc in retrieved_docs:
             # Use 'Product' metadata key, normalize it for self-filtering
             product_meta = doc.metadata.get('Product', '')
             if product_meta != target_product_input: # Simpler check
                 filtered_docs.append(doc)
-        # --- END FIX ---
 
         all_retrieved_chunks.extend(filtered_docs)
 
         for doc in filtered_docs:
-            # --- FIX: Consistently use the NEW metadata key 'Product' for product name retrieval ---
             product_name_meta = doc.metadata.get('Product')
-            company_name_meta = doc.metadata.get('Company') # This was already correct
+            company_name_meta = doc.metadata.get('Company')
 
             # Ensure data is valid before using as key
             if product_name_meta is None or company_name_meta is None:
@@ -605,128 +634,85 @@ def run_pipeline_execution_p1(api_key, merged_data, company_to_products_map, tar
     progress_bar.empty()
 
     sorted_candidates = sorted(candidate_product_summary.items(), key=lambda item: item[1]['total_chunks'], reverse=True)
-
-    # --- THIS IS THE KEY LIST YOU IDENTIFIED ---
     unique_candidates_keys = [key for key, value in sorted_candidates]
-    # ---------------------------------------------
 
     st.success(f"Found a total of **{len(sorted_candidates)}** unique potential partners from **{len(all_retrieved_chunks)}** retrieved chunks.")
 
-    # Prepare Intermediate Candidates Data Frame
+    # Prepare Candidate List (This is now the only initial list)
     intermediate_candidate_data = []
-    for company, product_name in unique_candidates_keys:
+    for rank, (company, product_name) in enumerate(unique_candidates_keys):
         stats = candidate_product_summary[(company, product_name)]
         angle_breakdown = ", ".join([f"{angle.replace('_', ' ').title()} ({count})" for angle, count in stats['angles'].items()])
         intermediate_candidate_data.append({
+            "Rank": rank + 1, # Add the Rank directly here
             "Product": product_name,  # Value from 'Product' metadata
             "Company": company,
             "Total Chunks": stats['total_chunks'],
             "Source Angles": angle_breakdown
         })
-    df_intermediate = pd.DataFrame(intermediate_candidate_data).reset_index(names=['Rank (by chunk count)'])
 
-    # --- Display Intermediate Candidate List (LLM 2 + RAG Output) ---
-    st.markdown("### Intermediate Candidate List (Ranked by Chunk Count)")
+    df_intermediate = pd.DataFrame(intermediate_candidate_data)
+
+    # MODIFIED: Reorder columns to place 'Rank' first, and implicitly remove 'Rank (by chunk count)'
+    column_order = ['Rank', 'Product', 'Company', 'Total Chunks', 'Source Angles']
+    df_intermediate = df_intermediate[column_order]
+
+    # --- Display Initial Candidate List (LLM 2 + RAG Output) ---
+    st.markdown("### Initial Candidate List (Ranked by Chunk Count)")
     if intermediate_candidate_data:
         st.dataframe(df_intermediate, use_container_width=True, hide_index=True)
     else:
          st.warning("No candidates were found in the RAG retrieval step.")
-    # --- END Display Fix ---
-
-    # --- STAGE 4: Batch Initial Synergy Analysis and Ranking (LLM 3) ---
-    st.markdown("---")
-    st.subheader("3️⃣ Automated Initial Synergy Ranking (LLM 3)")
-
-    all_initial_results = []
-    product_chunks_map = {}
-    for doc in all_retrieved_chunks:
-        # --- FIX: RAG METADATA ACCESS: MUST use 'Product' and 'Company' ---
-        product_name_meta = doc.metadata.get('Product')
-        company_name_meta = doc.metadata.get('Company')
-
-        if product_name_meta is None or company_name_meta is None:
-            continue
-
-        product_key = (company_name_meta, product_name_meta)
-        product_chunks_map.setdefault(product_key, []).append(doc.page_content)
-
-    num_candidates = len(unique_candidates_keys)
-    ranking_progress = st.progress(0, text=f"Starting initial analysis of {num_candidates} candidates...")
-
-    for i, (company, product_name) in enumerate(unique_candidates_keys):
-        ranking_progress.progress((i + 1) / num_candidates, text=f"Analyzing candidate {i+1}/{num_candidates}: {product_name}...")
-
-        candidate_chunks = product_chunks_map.get((company, product_name), [])
-        candidate_chunks_text = "\n\n---\n\n".join(candidate_chunks)
-
-        # Safegard for non-ASCII characters (kept from original)
-        candidate_chunks_text_clean = candidate_chunks_text.encode("ascii", "ignore").decode("ascii")
-
-        initial_analysis = scorer_chain.invoke({
-            "target_doc": clean_target_doc, # Use clean doc
-            "candidate_chunks_text": candidate_chunks_text_clean
-        })
-
-        score = initial_analysis.get('score', 0)
-        reasoning = initial_analysis.get('reasoning', 'No reasoning provided.')
-
-        all_initial_results.append({
-            "Rank": 0,
-            "Score": score,
-            "Product": product_name, # Value from 'Product' metadata
-            "Company": company,
-            "Justification": reasoning
-        })
-        time.sleep(0.1)
-
-    ranking_progress.progress(1.0, text="Analysis complete.")
-    time.sleep(1)
-    ranking_progress.empty()
-    st.success("All candidates analyzed.")
-
-    # --- Final Ranked Shortlist Output ---
-    ranked_shortlist = sorted(all_initial_results, key=lambda x: x['Score'], reverse=True)
-
-    for i, result in enumerate(ranked_shortlist):
-        result['Rank'] = i + 1
-
-    df_final = pd.DataFrame(ranked_shortlist)
 
     # -------------------------------------------------------------------
-    # --- NEW: STAGE 5: EXECUTE FULL-TEXT DISTANCE RANKING ---
+    # --- STAGE 3 (Was 4): EXECUTE FULL-TEXT RE-RANKING (OF EXISTING CANDIDATES) ---
     # -------------------------------------------------------------------
     st.markdown("---")
-    st.subheader("4️⃣ Full-Text Distance Ranking (by Pillar)")
+    # Renumbered for display
+    st.subheader("3️⃣ Full-Text Distance Re-Ranking (Specific Candidates)")
+
+    all_initial_results = [] # Keep empty, only needed for old Step 4
+
     with st.spinner("Loading product-level vector store and calculating distance ranking..."):
 
         # Load the product-level vector store (cached)
-        # This function is defined in Section 1
         product_vectorstore = load_product_vectorstore(api_key)
 
         if product_vectorstore is None:
             st.error("Product-Level Vector Store failed to load. Cannot calculate distance ranking.")
             distance_ranking_data = {}
+            global_retrieval_data = {} # Also fail Step 4
         else:
-            # --- THIS IS THE FIX ---
-            # Use the raw product keys from the RAG retrieval step (Stage 2/3)
-            # 'unique_candidates_keys' is a list of tuples: (Company, Product)
+            # Use the raw product keys from the RAG retrieval step (Stage 2)
             final_product_list = [product for (company, product) in unique_candidates_keys]
-            # --- END FIX ---
 
-            # Calculate the new ranking based on the LLM1 strategies
-            # This function is defined in Section 1
-            # synergy_strategies is the flat {key: value} dict, which
-            # execute_full_text_ranking now correctly iterates over.
+            # Execute Step 3 (Re-ranking - formerly Step 4)
             distance_ranking_data = execute_full_text_ranking(
                 product_vectorstore,
                 synergy_strategies,
                 final_product_list
             )
             st.success("Full-text distance ranking complete.")
+
+            # -------------------------------------------------------------------
+            # --- NEW: STAGE 4 (Was 5): EXECUTE GLOBAL PRODUCT RETRIEVAL (FRESH SEARCH) ---
+            # -------------------------------------------------------------------
+            st.markdown("---")
+            st.subheader("4️⃣ Global Vector Search (Pure Distance)")
+            st.info("Performing a FRESH search against the entire Product database to find the absolute closest vectors to the strategic pillars.")
+
+            with st.spinner("Executing global product vector retrieval..."):
+                 global_retrieval_data = execute_product_level_retrieval_step5(
+                    product_vectorstore,
+                    synergy_strategies,
+                    target_product_input, # To self-filter
+                    top_k=8 # Uses the new default of 8
+                 )
+                 st.success("Global retrieval complete.")
     # -------------------------------------------------------------------
 
-    # Return all dataframes, the strategist output, AND the new company ranking data
-    return df_final, df_intermediate, synergy_strategies, distance_ranking_data
+    # Return the remaining data structures (df_final is now df_intermediate)
+    return df_intermediate, synergy_strategies, distance_ranking_data, global_retrieval_data
 
 # ==============================================================================
 # SECTION 4: PIPELINE 2 EXECUTION LOGIC (Adapted from original script)
@@ -899,12 +885,8 @@ def reset_pipeline_2_state():
 # Button 1: Reset Global API Key (Resets API for both pipelines)
 if st.sidebar.button("Reset API Key", type="secondary", key='global_api_reset'):
     st.session_state.api_key = ""
-    # --- FIXED: Removed the problematic line that caused the StreamlitAPIException ---
-    # if 'global_api_key_input' in st.session_state:
-    #     st.session_state['global_api_key_input'] = ""
-    # -------------------------------------------------------------------------------
     st.rerun()
-    st.stop() # <-- Keep the stop to prevent script re-run
+    st.stop()
 
 # Button 2: Reset Active Pipeline
 pipeline_reset_label = "Reset Pipeline 1 (Synergy Filtering)" if st.session_state.page == 'p1' else "Reset Pipeline 2 (1-on-1 Deep Dive)"
@@ -915,7 +897,7 @@ if st.sidebar.button(pipeline_reset_label, type="secondary", key='active_pipelin
     elif st.session_state.page == 'p2':
         reset_pipeline_2_state()
     st.rerun()
-    st.stop() # <-- Add st.stop() here as well
+    st.stop()
 
 # ==============================================================================
 # VIEW 1: PIPELINE 1 - SYNERGY FILTERING
@@ -963,17 +945,17 @@ if st.session_state.page == 'p1':
             # 1. Check API Key
             if not st.session_state.api_key:
                 st.error("Please provide an OpenAI API Key.")
-                st.stop() # <-- ADDED st.stop()
+                st.stop()
 
             # 2. Check Company
             elif target_company_select == company_options[0]:
                 st.error("Please select a company.")
-                st.stop() # <-- ADDED st.stop()
+                st.stop()
 
             # 3. Check Product
             elif not available_products or target_product_input == available_products[0]:
                 st.error("Please select a product.")
-                st.stop() # <-- ADDED st.stop()
+                st.stop()
 
             # If all checks pass, proceed to setup:
             else:
@@ -998,7 +980,7 @@ if st.session_state.page == 'p1':
                         st.session_state.estimated_cost_data_p1 = {
                             'tokens': total_tokens,
                             'cost': total_cost,
-                            'N_c': N_c_estimate,
+                            'N_c': N_c_estimate, # N_c is now 0 but kept for function signature consistency
                             'target': target_product_input, # <-- Store the product
                             'angles': num_angles,
                             'model_name': st.session_state.selected_model # Store model used for estimate
@@ -1026,7 +1008,7 @@ if st.session_state.page == 'p1':
         col1.metric(f"Estimated Cost ({model_display_name})", f"${cost_data['cost']:.4f} USD")
         col2.metric("Estimated Total Tokens", f"{cost_data['tokens']:,}")
 
-        st.info(f"The estimate for scoring is based on a conservative **{cost_data['N_c']}** potential candidates. The actual cost may be lower if fewer candidates are retrieved.")
+        st.info("The estimated cost now only includes the LLM calls for Strategy Generation (Step 1) and Profiling (Step 2).")
 
         if st.button("CONFIRM & RUN FULL PIPELINE", type="secondary", key='p1_confirm_run_button'):
             st.session_state.pipeline_stage_p1 = 'running'
@@ -1048,23 +1030,25 @@ if st.session_state.page == 'p1':
             # Load chunk-level vector store
             vectorstore = load_vectorstore(st.session_state.api_key)
 
-            # MODIFIED: Pass all required data, including the new company_to_products_map
-            # The function signature was updated to accept all the necessary items
-            df_final, df_intermediate, synergy_strategies, distance_ranking_data = run_pipeline_execution_p1(
+            # MODIFIED: Update function call and unpacking
+            df_intermediate, synergy_strategies, distance_ranking_data, global_retrieval_data = run_pipeline_execution_p1(
                 st.session_state.api_key, merged_data, company_to_products_map, target_product_input, num_angles, vectorstore, model_name_to_run
             )
 
             st.session_state.final_results_p1 = {
                 'target': target_product_input,
-                'shortlist_df': df_final,
-                'intermediate_df': df_intermediate,
+                # df_intermediate is now the primary shortlist (formerly df_final)
+                'shortlist_df': df_intermediate,
                 'synergy_strategies': synergy_strategies,
-                'distance_ranking': distance_ranking_data # <-- NEW: Store the ranking data
+                # Step 4 renamed to 3
+                'distance_ranking': distance_ranking_data,
+                # Step 5 renamed to 4
+                'global_retrieval': global_retrieval_data
             }
 
             # Set stage to complete AFTER outputting intermediate results
             st.session_state.pipeline_stage_p1 = 'complete'
-            st.success(f"Pipeline 1 Complete. Found {len(df_final)} candidates.")
+            st.success(f"Pipeline 1 Complete. Found {len(df_intermediate)} candidates.")
             st.balloons()
             st.rerun() # Rerun to switch to the final results display
 
@@ -1079,10 +1063,11 @@ if st.session_state.page == 'p1':
         results = st.session_state.final_results_p1
         st.subheader(f"✅ Pipeline 1 Complete for **{results['target']}**")
         st.markdown("---")
+        # df_intermediate is now df_final in results
         df_final = results['shortlist_df']
-        df_intermediate = results['intermediate_df']
         synergy_strategies = results['synergy_strategies']
-        distance_ranking_data = results['distance_ranking'] # <-- NEW: Extract the ranking data
+        distance_ranking_data = results['distance_ranking'] # Step 3 (formerly 4) Data
+        global_retrieval_data = results.get('global_retrieval', {}) # Step 4 (formerly 5) Data
 
         # --- Display Strategist JSON Output FIRST ---
         st.subheader("1️⃣ Dynamic Strategy Generation (LLM 1)")
@@ -1091,49 +1076,40 @@ if st.session_state.page == 'p1':
 
         if not df_final.empty:
 
-            # Display Intermediate Candidates second
-            st.subheader("2️⃣ Candidate Profiling and RAG Retrieval (LLM 2 + Chroma)")
+            # Display Initial Candidates List (Now the main list)
+            st.subheader("2️⃣ Initial Candidate List (Ranked by Chunk Count)")
             st.info("These candidates were retrieved by the RAG step and ranked purely on the volume of matching chunks.")
-            st.dataframe(df_intermediate, use_container_width=True, hide_index=True)
+            st.dataframe(df_final.style.bar(subset=['Total Chunks'], color='#5fb2b7'), use_container_width=True, hide_index=True)
             st.markdown("---")
 
-            # --- Inline CSS for DataFrame Justification Wrapping (Applies to final table) ---
-            st.markdown(
-                """
-                <style>
-                /* Target the Justification column cells in the final DataFrame */
-                .stDataFrame .data-row > div:nth-child(5) div {
-                    white-space: pre-wrap !important;
-                    word-wrap: break-word !important;
-                    overflow-x: hidden !important;
-                    max-height: 100%;
-                }
-                </style>
-                """,
-                unsafe_allow_html=True
-            )
-            # ----------------------------------------------------
-
-            # Display Final Shortlist
-            st.subheader("3️⃣ Final Ranked Synergy Shortlist (Ranked by LLM Score)")
-            st.info("The final ranking after LLM-powered initial synergy assessment (LLM 3).")
-            st.dataframe(df_final.style.bar(subset=['Score'], color='#5fb2b7'), use_container_width=True, hide_index=True)
-            st.markdown("---")
-
-            # --- NEW DISPLAY: Full-Text Distance Ranking ---
-            st.subheader("4️⃣ Full-Text Distance Ranking (by Pillar)")
-            st.info("Re-ranking the shortlist from (3) by comparing pillars to full product-level embeddings.")
+            # --- Display: Full-Text Distance Re-Ranking ---
+            st.subheader("3️⃣ Full-Text Distance Re-Ranking (Specific Candidates)")
+            st.info("Re-ranking the candidates from (2) by comparing pillars to full product-level embeddings.")
 
             if distance_ranking_data:
                 for pillar, ranking in distance_ranking_data.items():
                     with st.expander(f"Ranking for Pillar: {pillar}", expanded=False):
-                        # Convert the list of dicts to a DataFrame for display
                         df_ranking = pd.DataFrame(ranking)
                         st.dataframe(df_ranking, use_container_width=True, hide_index=True)
-                st.markdown("---")
             else:
-                st.warning("Full-Text Distance Ranking could not be generated (check API Key and vector store status).")
-            # --- END NEW DISPLAY ---
+                st.warning("Full-Text Distance Ranking could not be generated.")
+
+            st.markdown("---")
+
+            # --- NEW DISPLAY: Step 4 Global Retrieval (Formerly 5) ---
+            st.subheader("4️⃣ Global Vector Search (Pure Distance)")
+            st.info("These are the closest matches found in the entire database by purely mathematical distance to the pillars.")
+
+            if global_retrieval_data:
+                for pillar, results in global_retrieval_data.items():
+                    with st.expander(f"Global Top Matches for: {pillar}", expanded=False):
+                         df_global = pd.DataFrame(results)
+                         st.dataframe(df_global, use_container_width=True, hide_index=True)
+            else:
+                st.warning("Global retrieval returned no results (check Vector Store status).")
+            # --- END Step 4 Display ---
+
+            st.markdown("---")
 
             st.info("The top-ranked candidates are now available as a reference in Pipeline 2 for 1-on-1 deep dive analysis.")
 
@@ -1210,30 +1186,30 @@ elif st.session_state.page == 'p2':
         run_collection_button = st.button(f"Prepare Data ({data_source_label})", type="primary", key='p2_prepare_button')
 
 
-    # --- (THIS IS THE MODIFIED BLOCK) ---
-    # --- Display P1 Results as Reference (MODIFIED: Show Output 4 - Distance Ranking) ---
-    if st.session_state.final_results_p1: # Check if P1 has run
+    # --- Display P1 Results as Reference (MODIFIED to show Step 4/Global Search) ---
+    if st.session_state.final_results_p1:
         target_p1 = st.session_state.final_results_p1['target']
-        distance_ranking_data = st.session_state.final_results_p1.get('distance_ranking', {}) # Get the ranking data
+        # Use Global Retrieval (Step 4) data as the primary reference
+        global_retrieval_data = st.session_state.final_results_p1.get('global_retrieval', {})
 
-        with st.expander(f"⭐ **Pipeline 1 Distance Ranking Reference** (Target: {target_p1})", expanded=True):
+        # Use an expander that emphasizes the Step 4 data
+        with st.expander(f"⭐ **Pipeline 1 Global Search Reference** (Target: {target_p1})", expanded=True):
 
-            if distance_ranking_data:
-                st.info("The candidates below are ranked by **full-text vector distance** to each strategic pillar (Output 4 from P1). Lower distance is better.")
+            if global_retrieval_data:
+                st.info("The candidates below are the **Top 8 Global Matches** found by vector distance to the strategic pillars (Output 4 from P1). Lower distance is better.")
 
                 # Iterate and display each pillar's ranking
-                for pillar, ranking in distance_ranking_data.items():
-                    st.markdown(f"**Ranking for Pillar: {pillar}**")
+                for pillar, ranking in global_retrieval_data.items():
+                    st.markdown(f"**Top 8 Matches for Pillar: {pillar}**")
                     # Convert the list of dicts to a DataFrame for display
                     df_ranking = pd.DataFrame(ranking)
                     # Use a compact dataframe for the reference box, max height 200px
                     st.dataframe(df_ranking, use_container_width=True, hide_index=True, height=200)
 
             else:
-                st.warning("Pipeline 1 was run, but no Full-Text Distance Ranking data was generated or found in the results.")
+                st.warning("Pipeline 1 was run, but no Global Search Ranking data was generated or found in the results.")
     else:
         st.info("No results found from Pipeline 1. Run Pipeline 1 first to generate a candidate list for reference. Or select any 2 Products to run 1-on-1 synergy analysis.")
-    # --- (END OF MODIFIED BLOCK) ---
 
     st.markdown("---")
 
@@ -1490,43 +1466,26 @@ elif st.session_state.page == 'p2':
             unsafe_allow_html=True
         )
 
-        # --- NEW FEEDBACK SECTION ---
+        # --- FEEDBACK SECTION ---
         st.markdown("---")
         st.subheader("📊 Rate This Analysis")
-        
+
         with st.form(key="feedback_form"):
-            # Get context from the analysis that was run
             analysis_context = st.session_state.collected_data_p2
-            
-            # Get product/company names from the session state keys used to run the analysis
             product_1 = st.session_state.get('product_1_select_p2', 'Unknown Product 1')
             company_1 = st.session_state.get('p2_company_1_select', 'Unknown Company 1')
             product_2 = st.session_state.get('product_2_select_p2', 'Unknown Product 2')
             company_2 = st.session_state.get('p2_company_2_select', 'Unknown Company 2')
-
-            # Get mode and model from the stored analysis data
             mode = analysis_context.get('mode', 'Unknown Mode')
             model_name = analysis_context.get('model_name', 'Unknown Model')
 
-            # Sliders
-            usefulness_score = st.slider(
-                "Usefulness of Analysis",
-                min_value=1, max_value=10, value=7, key="fb_usefulness"
-            )
-            specificity_score = st.slider(
-                "Specificity of Analysis",
-                min_value=1, max_value=10, value=7, key="fb_specificity"
-            )
-            actionability_score = st.slider(
-                "Actionability of Insights",
-                min_value=1, max_value=10, value=7, key="fb_actionability"
-            )
+            usefulness_score = st.slider("Usefulness of Analysis", 1, 10, 7, key="fb_usefulness")
+            specificity_score = st.slider("Specificity of Analysis", 1, 10, 7, key="fb_specificity")
+            actionability_score = st.slider("Actionability of Insights", 1, 10, 7, key="fb_actionability")
 
-            # Submit Button
             submitted = st.form_submit_button("Submit Feedback")
 
             if submitted:
-                # <-- MODIFIED: This dictionary is now "flat" to match the GSheet headers
                 feedback_data = {
                     "timestamp": pd.Timestamp.now().isoformat(),
                     "model_used": model_name,
@@ -1540,10 +1499,8 @@ elif st.session_state.page == 'p2':
                     "score_actionability": actionability_score,
                     "full_report": st.session_state.analysis_report_p2
                 }
-                
-                # Call the new save function
+
                 if save_feedback(feedback_data):
                     st.success("Thank you for your feedback! It has been recorded.")
                 else:
                     st.error("There was an error saving your feedback. Check app logs.")
-        # --- END NEW FEEDBACK SECTION ---
